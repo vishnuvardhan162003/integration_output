@@ -13,7 +13,8 @@ async function start() {
     server = app.listen(PORT, () => {
       logger.info(`Eduzyra API listening on http://localhost:${PORT}`)
     })
-  } catch (err) {
+    } catch (err) {
+    console.error('STARTUP ERROR:', err)
     logger.error('Failed to start server:', { error: err.message, stack: err.stack })
     process.exit(1)
   }
