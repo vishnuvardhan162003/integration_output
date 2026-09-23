@@ -1,15 +1,19 @@
 /**
  * emailService — centralised outbound email for Eduzyra.
  *
- * Transport: Brevo Transactional Email HTTP API (https://api.brevo.com/v3/smtp/email).
+ * Transport: Resend Transactional Email HTTP API (https://api.resend.com/emails).
  * We use the HTTPS API instead of raw SMTP because most PaaS hosts (Render
  * included) block outbound SMTP ports (25/465/587), which caused OTP/reset
  * emails to silently time out. The HTTPS API runs over port 443, which is
  * never blocked.
  *
  * Required env vars:
- *   BREVO_API_KEY       — from Brevo → Settings → SMTP & API → API Keys & MCP
- *   EMAIL_FROM_ADDRESS   — verified sender address in Brevo (optional, has default)
+ *   RESEND_API_KEY       — from Resend → API Keys → Create API Key
+ *   EMAIL_FROM_ADDRESS   — verified sender address (optional; defaults to
+ *                          'onboarding@resend.dev', Resend's shared test
+ *                          sender, which only delivers to the email address
+ *                          used to sign up for the Resend account until a
+ *                          custom domain is verified)
  *   EMAIL_FROM_NAME      — display name (optional, defaults to "Eduzyra")
  *
  * Templates: all emails use inline-styled responsive HTML (email clients strip
@@ -41,38 +45,42 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;')
 }
 
-// ── Brevo (Sendinblue) HTTP API sender ────────────────────────────────────
+// ── Resend HTTP API sender ─────────────────────────────────────────────────
 // Render/most PaaS block outbound raw SMTP ports (25/465/587), so we send
-// via Brevo's HTTPS transactional email API instead of nodemailer + SMTP.
-const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email'
+// via Resend's HTTPS transactional email API instead of nodemailer + SMTP.
+// Resend activates new accounts immediately (no manual review), unlike some
+// other providers. Until a custom sending domain is verified in Resend, mail
+// must be sent FROM 'onboarding@resend.dev' and can only be delivered TO the
+// email address used to sign up for the Resend account.
+const RESEND_API_URL = 'https://api.resend.com/emails'
 
-async function sendViaBrevo({ to, subject, html }) {
-  const apiKey = process.env.BREVO_API_KEY
+async function sendViaResend({ to, subject, html }) {
+  const apiKey = process.env.RESEND_API_KEY
   if (!apiKey) {
-    throw new Error('BREVO_API_KEY not configured — set it in your environment variables')
+    throw new Error('RESEND_API_KEY not configured — set it in your environment variables')
   }
 
   const fromName = process.env.EMAIL_FROM_NAME || 'Eduzyra'
-  const fromEmail = process.env.EMAIL_FROM_ADDRESS || process.env.SMTP_USER || 'noreply@eduzyra.dev'
+  // Use Resend's shared test sender unless a verified custom domain sender is set.
+  const fromEmail = process.env.EMAIL_FROM_ADDRESS || 'onboarding@resend.dev'
 
-  const res = await fetch(BREVO_API_URL, {
+  const res = await fetch(RESEND_API_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'api-key': apiKey,
-      Accept: 'application/json',
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      sender: { name: fromName, email: fromEmail },
-      to: [{ email: to }],
+      from: `${fromName} <${fromEmail}>`,
+      to: [to],
       subject,
-      htmlContent: html,
+      html,
     }),
   })
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '')
-    throw new Error(`Brevo API error ${res.status}: ${errText}`)
+    throw new Error(`Resend API error ${res.status}: ${errText}`)
   }
 
   return true
@@ -132,17 +140,17 @@ function emailWrapper(title, bodyHtml) {
 </html>`
 }
 
-/** Centralised send — wraps the Brevo API call in try/catch, logs failures. */
+/** Centralised send — wraps the Resend API call in try/catch, logs failures. */
 async function send({ to, subject, html }) {
   try {
-    await sendViaBrevo({ to, subject, html })
+    await sendViaResend({ to, subject, html })
     return true
   } catch (err) {
     const errorMessage = err?.message || String(err)
-    const isMissingKey = errorMessage.includes('BREVO_API_KEY not configured')
+    const isMissingKey = errorMessage.includes('RESEND_API_KEY not configured')
 
     if (isMissingKey && process.env.NODE_ENV !== 'production') {
-      console.warn('[emailService] BREVO_API_KEY not configured. Dev fallback: email content will be logged to the console.')
+      console.warn('[emailService] RESEND_API_KEY not configured. Dev fallback: email content will be logged to the console.')
       console.group('[emailService] DEV EMAIL OUTPUT')
       console.log('to:', to)
       console.log('subject:', subject)
