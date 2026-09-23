@@ -1,10 +1,16 @@
-import nodemailer from 'nodemailer'
-
 /**
  * emailService — centralised outbound email for Eduzyra.
  *
- * Transport: SMTP (Gmail App Password OR Brevo SMTP — both work via the same
- * env vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS).
+ * Transport: Brevo Transactional Email HTTP API (https://api.brevo.com/v3/smtp/email).
+ * We use the HTTPS API instead of raw SMTP because most PaaS hosts (Render
+ * included) block outbound SMTP ports (25/465/587), which caused OTP/reset
+ * emails to silently time out. The HTTPS API runs over port 443, which is
+ * never blocked.
+ *
+ * Required env vars:
+ *   BREVO_API_KEY       — from Brevo → Settings → SMTP & API → API Keys & MCP
+ *   EMAIL_FROM_ADDRESS   — verified sender address in Brevo (optional, has default)
+ *   EMAIL_FROM_NAME      — display name (optional, defaults to "Eduzyra")
  *
  * Templates: all emails use inline-styled responsive HTML (email clients strip
  * <style> tags, so styles must be inline). Each function builds its own HTML
@@ -35,31 +41,41 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;')
 }
 
-// ── Lazy transporter singleton ────────────────────────────────────────────
-// Lazily created on first send so the app can boot without SMTP configured.
-// The error only surfaces when an email is actually sent.
-let _transporter = null
+// ── Brevo (Sendinblue) HTTP API sender ────────────────────────────────────
+// Render/most PaaS block outbound raw SMTP ports (25/465/587), so we send
+// via Brevo's HTTPS transactional email API instead of nodemailer + SMTP.
+const BREVO_API_URL = 'https://api.brevo.com/v3/smtp/email'
 
-function getTransporter() {
-  if (_transporter) return _transporter
-
-  const host = process.env.SMTP_HOST
-  const port = Number(process.env.SMTP_PORT) || 587
-  const user = process.env.SMTP_USER
-  const pass = process.env.SMTP_PASS
-
-  if (!host || !user || !pass) {
-    throw new Error('SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS in .env')
+async function sendViaBrevo({ to, subject, html }) {
+  const apiKey = process.env.BREVO_API_KEY
+  if (!apiKey) {
+    throw new Error('BREVO_API_KEY not configured — set it in your environment variables')
   }
 
-  _transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465, // true for 465 (SSL), false for 587 (STARTTLS)
-    auth: { user, pass },
+  const fromName = process.env.EMAIL_FROM_NAME || 'Eduzyra'
+  const fromEmail = process.env.EMAIL_FROM_ADDRESS || process.env.SMTP_USER || 'noreply@eduzyra.dev'
+
+  const res = await fetch(BREVO_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': apiKey,
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: fromName, email: fromEmail },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
   })
 
-  return _transporter
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '')
+    throw new Error(`Brevo API error ${res.status}: ${errText}`)
+  }
+
+  return true
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -116,30 +132,17 @@ function emailWrapper(title, bodyHtml) {
 </html>`
 }
 
-/** Get the FROM address from env, with a sensible default. */
-function fromAddress() {
-  const name = process.env.EMAIL_FROM_NAME || 'Eduzyra'
-  const addr = process.env.EMAIL_FROM_ADDRESS || 'noreply@eduzyra.dev'
-  return `"${escapeHtml(name)}" <${addr}>`
-}
-
-/** Centralised send — wraps transporter.sendMail in try/catch, logs failures. */
+/** Centralised send — wraps the Brevo API call in try/catch, logs failures. */
 async function send({ to, subject, html }) {
   try {
-    const transporter = getTransporter()
-    await transporter.sendMail({
-      from: fromAddress(),
-      to,
-      subject,
-      html,
-    })
+    await sendViaBrevo({ to, subject, html })
     return true
   } catch (err) {
     const errorMessage = err?.message || String(err)
-    const isMissingSmtp = errorMessage.includes('SMTP not configured')
+    const isMissingKey = errorMessage.includes('BREVO_API_KEY not configured')
 
-    if (isMissingSmtp && process.env.NODE_ENV !== 'production') {
-      console.warn('[emailService] SMTP not configured. Dev fallback: email content will be logged to the console.')
+    if (isMissingKey && process.env.NODE_ENV !== 'production') {
+      console.warn('[emailService] BREVO_API_KEY not configured. Dev fallback: email content will be logged to the console.')
       console.group('[emailService] DEV EMAIL OUTPUT')
       console.log('to:', to)
       console.log('subject:', subject)
