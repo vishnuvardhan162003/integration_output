@@ -1,20 +1,10 @@
+import nodemailer from 'nodemailer'
+
 /**
  * emailService — centralised outbound email for Eduzyra.
  *
- * Transport: Resend Transactional Email HTTP API (https://api.resend.com/emails).
- * We use the HTTPS API instead of raw SMTP because most PaaS hosts (Render
- * included) block outbound SMTP ports (25/465/587), which caused OTP/reset
- * emails to silently time out. The HTTPS API runs over port 443, which is
- * never blocked.
- *
- * Required env vars:
- *   RESEND_API_KEY       — from Resend → API Keys → Create API Key
- *   EMAIL_FROM_ADDRESS   — verified sender address (optional; defaults to
- *                          'onboarding@resend.dev', Resend's shared test
- *                          sender, which only delivers to the email address
- *                          used to sign up for the Resend account until a
- *                          custom domain is verified)
- *   EMAIL_FROM_NAME      — display name (optional, defaults to "Eduzyra")
+ * Transport: SMTP (Gmail App Password OR Brevo SMTP — both work via the same
+ * env vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS).
  *
  * Templates: all emails use inline-styled responsive HTML (email clients strip
  * <style> tags, so styles must be inline). Each function builds its own HTML
@@ -45,45 +35,31 @@ function escapeHtml(str) {
     .replace(/'/g, '&#039;')
 }
 
-// ── Resend HTTP API sender ─────────────────────────────────────────────────
-// Render/most PaaS block outbound raw SMTP ports (25/465/587), so we send
-// via Resend's HTTPS transactional email API instead of nodemailer + SMTP.
-// Resend activates new accounts immediately (no manual review), unlike some
-// other providers. Until a custom sending domain is verified in Resend, mail
-// must be sent FROM 'onboarding@resend.dev' and can only be delivered TO the
-// email address used to sign up for the Resend account.
-const RESEND_API_URL = 'https://api.resend.com/emails'
+// ── Lazy transporter singleton ────────────────────────────────────────────
+// Lazily created on first send so the app can boot without SMTP configured.
+// The error only surfaces when an email is actually sent.
+let _transporter = null
 
-async function sendViaResend({ to, subject, html }) {
-  const apiKey = process.env.RESEND_API_KEY
-  if (!apiKey) {
-    throw new Error('RESEND_API_KEY not configured — set it in your environment variables')
+function getTransporter() {
+  if (_transporter) return _transporter
+
+  const host = process.env.SMTP_HOST
+  const port = Number(process.env.SMTP_PORT) || 587
+  const user = process.env.SMTP_USER
+  const pass = process.env.SMTP_PASS
+
+  if (!host || !user || !pass) {
+    throw new Error('SMTP not configured — set SMTP_HOST, SMTP_USER, SMTP_PASS in .env')
   }
 
-  const fromName = process.env.EMAIL_FROM_NAME || 'Eduzyra'
-  // Use Resend's shared test sender unless a verified custom domain sender is set.
-  const fromEmail = process.env.EMAIL_FROM_ADDRESS || 'onboarding@resend.dev'
-
-  const res = await fetch(RESEND_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      from: `${fromName} <${fromEmail}>`,
-      to: [to],
-      subject,
-      html,
-    }),
+  _transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465, // true for 465 (SSL), false for 587 (STARTTLS)
+    auth: { user, pass },
   })
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '')
-    throw new Error(`Resend API error ${res.status}: ${errText}`)
-  }
-
-  return true
+  return _transporter
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -140,17 +116,30 @@ function emailWrapper(title, bodyHtml) {
 </html>`
 }
 
-/** Centralised send — wraps the Resend API call in try/catch, logs failures. */
+/** Get the FROM address from env, with a sensible default. */
+function fromAddress() {
+  const name = process.env.EMAIL_FROM_NAME || 'Eduzyra'
+  const addr = process.env.EMAIL_FROM_ADDRESS || 'noreply@eduzyra.dev'
+  return `"${escapeHtml(name)}" <${addr}>`
+}
+
+/** Centralised send — wraps transporter.sendMail in try/catch, logs failures. */
 async function send({ to, subject, html }) {
   try {
-    await sendViaResend({ to, subject, html })
+    const transporter = getTransporter()
+    await transporter.sendMail({
+      from: fromAddress(),
+      to,
+      subject,
+      html,
+    })
     return true
   } catch (err) {
     const errorMessage = err?.message || String(err)
-    const isMissingKey = errorMessage.includes('RESEND_API_KEY not configured')
+    const isMissingSmtp = errorMessage.includes('SMTP not configured')
 
-    if (isMissingKey && process.env.NODE_ENV !== 'production') {
-      console.warn('[emailService] RESEND_API_KEY not configured. Dev fallback: email content will be logged to the console.')
+    if (isMissingSmtp && process.env.NODE_ENV !== 'production') {
+      console.warn('[emailService] SMTP not configured. Dev fallback: email content will be logged to the console.')
       console.group('[emailService] DEV EMAIL OUTPUT')
       console.log('to:', to)
       console.log('subject:', subject)
